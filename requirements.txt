@@ -1,0 +1,35 @@
+# Dépendances du projet PM MTN CI — Projet MS-Huawei
+# Python 3.14 | PostgreSQL 16
+
+# ORM & migrations
+sqlalchemy>=2.0.30
+alembic>=1.13.1
+
+# Driver PostgreSQL (version binaire, compatible Windows)
+psycopg2-binary>=2.9.9
+
+# Variables d'environnement
+python-dotenv>=1.0.1
+
+# API web
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.1
+
+# Traitement Excel / imports SBC
+openpyxl>=3.1.2
+pandas>=2.2.2
+
+# Tests
+pytest>=8.2.0
+pytest-asyncio>=0.23.6
+
+# Sécurité (hachage des mots de passe + JWT)
+passlib[bcrypt]>=1.7.4
+python-jose[cryptography]>=3.3.0
+email-validator>=2.1.0
+
+# Sérialisation / validation (utilisé avec FastAPI)
+pydantic>=2.7.0
+
+# Planification de tâches (alertes mensuelles)
+apscheduler>=3.10.4
