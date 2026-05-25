@@ -43,6 +43,22 @@ def _safe_date_from_excel(val) -> Optional[date]:
         return None
 
 
+def _detect_header_row(df_raw: pd.DataFrame, target_columns: list) -> int:
+    for i in range(min(15, len(df_raw))):
+        row_values = [
+            str(v).strip().lower()
+            for v in df_raw.iloc[i].values
+            if str(v) not in ('nan', 'None', '')
+        ]
+        matches = sum(
+            1 for col in target_columns
+            if any(col.lower() in rv for rv in row_values)
+        )
+        if matches >= len(target_columns) * 0.6:
+            return i
+    return 0
+
+
 def _get_site_or_404(db: Session, code_site: str) -> Site:
     site = db.execute(
         select(Site).where(Site.code_site == code_site)
@@ -50,6 +66,26 @@ def _get_site_or_404(db: Session, code_site: str) -> Site:
     if not site:
         raise HTTPException(status_code=404, detail=f"Site {code_site} introuvable")
     return site
+
+
+@router.post("", response_model=SiteResponse, status_code=201, summary="Créer un site")
+def create_site(
+    site: SiteCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(RoleEnum.admin, RoleEnum.manager)),
+):
+    existing = db.execute(
+        select(Site).where(
+            func.lower(func.trim(Site.code_site)) == site.code_site.strip().lower()
+        )
+    ).scalar_one_or_none()
+    if existing:
+        raise HTTPException(400, f"Le code site {site.code_site} existe déjà")
+    new_site = Site(**site.model_dump())
+    db.add(new_site)
+    db.commit()
+    db.refresh(new_site)
+    return new_site
 
 
 @router.get("", response_model=PaginatedResponse[SiteResponse], summary="Liste des sites")
@@ -103,16 +139,35 @@ def site_stats(
     return {"par_categorie_sbc": [{"categorie": r.categorie.value, "sbc": r.sbc.value, "total": r.n} for r in rows]}
 
 
+# ── Routes de consultation des détails du site ──────────────────────────────────
+
+# ── Routes de consultation des détails du site ──────────────────────────────────
+
 @router.get("/{code_site}/detail", response_model=SiteDetailResponse, summary="Détail complet d'un site avec stats et historique")
-def get_site_detail(
+def get_site_extended_detail(
     code_site: str,
     annee: int = Query(2026),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    site = _get_site_or_404(db, code_site)
+    """
+    Récupère le profil complet du site (KPIs, planning annuel, historique des WO et snags).
+    Parfaitement aligné sur la clé primaire numérique du modèle.
+    """
+    # 1. Récupération du site via son code textuel (ex: CI01605)
+    site = db.execute(
+        select(Site).where(Site.code_site == code_site.upper())
+    ).scalar_one_or_none()
+    
+    if not site:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Le site avec le code {code_site} est introuvable."
+        )
+
     today = date.today()
 
+    # 2. Récupération de tous les passages planifiés via site.id (clé primaire numérique)
     passages = db.execute(
         select(Passage)
         .where(Passage.site_id == site.id, Passage.annee == annee)
@@ -130,6 +185,7 @@ def get_site_detail(
         if p.statut == StatutPassageEnum.Prevu and p.date_planifiee >= today
     )
 
+    # 3. Récupération de la dernière exécution (Work Order) via site.id
     dernier_exec = db.execute(
         select(Execution.date_execution)
         .where(Execution.site_id == site.id)
@@ -137,6 +193,7 @@ def get_site_detail(
         .limit(1)
     ).scalar_one_or_none()
 
+    # 4. Calcul du prochain passage à venir via site.id
     prochain = db.execute(
         select(Passage.date_planifiee)
         .where(
@@ -149,6 +206,7 @@ def get_site_detail(
         .limit(1)
     ).scalar_one_or_none()
 
+    # 5. Construction de l'historique technique et cartographie des snags
     historique = []
     snag_map: dict[str, dict] = {}
     for p in passages:
@@ -194,12 +252,12 @@ def get_site_detail(
         "region": site.region,
         "type_alimentation": site.type_alimentation,
         "cycle": site.cycle,
-        "actif": site.actif,
-        "date_acceptance": site.date_acceptance,
-        "created_at": site.created_at,
-        "updated_at": site.updated_at,
-        "marque_ge": None,
-        "puissance_ge": None,
+        "actif": getattr(site, 'actif', True),
+        "date_acceptance": getattr(site, 'date_acceptance', None),
+        "created_at": getattr(site, 'created_at', None),
+        "updated_at": getattr(site, 'updated_at', None),
+        "marque_ge": getattr(site, 'marque_ge', None),
+        "puissance_ge": getattr(site, 'puissance_ge', None),
         "stats": {
             "total_passages_annee": total,
             "passages_faits": n_faits,
@@ -214,34 +272,20 @@ def get_site_detail(
     }
 
 
-@router.get("/{code_site}", response_model=SiteResponse, summary="Détail d'un site")
-def get_site(
+@router.get("/{code_site}", response_model=SiteResponse, summary="Aiguillage simplifié pour le détail d'un site")
+def get_site_simplified_detail(
     code_site: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return _get_site_or_404(db, code_site)
-
-
-@router.post("", response_model=SiteResponse, status_code=201, summary="Créer un site")
-def create_site(
-    data: SiteCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles(RoleEnum.admin, RoleEnum.manager)),
-):
-    try:
-        if db.execute(select(Site).where(Site.code_site == data.code_site)).scalar_one_or_none():
-            raise HTTPException(400, f"Le site {data.code_site} existe déjà")
-        site = Site(**data.model_dump())
-        db.add(site)
-        db.commit()
-        db.refresh(site)
-        return site
-    except HTTPException:
-        raise
-    except Exception:
-        print(f"DETAILED ERROR create_site:\n{traceback.format_exc()}", flush=True)
-        raise HTTPException(status_code=500, detail="Erreur interne lors de la création du site")
+    site = db.execute(
+        select(Site).where(
+            func.lower(func.trim(Site.code_site)) == code_site.strip().lower()
+        )
+    ).scalar_one_or_none()
+    if not site:
+        raise HTTPException(status_code=404, detail="Site introuvable.")
+    return site
 
 
 @router.put("/{code_site}", response_model=SiteResponse, summary="Modifier un site")
@@ -339,16 +383,53 @@ def mise_a_jour_mensuelle(
         raise HTTPException(400, "Seuls les fichiers Excel (.xlsx / .xls) sont acceptés")
 
     contents = file.file.read()
+
+    # ── Détection automatique du format ──────────────────────────────────────
     try:
-        df = pd.read_excel(io.BytesIO(contents))
+        df_raw = pd.read_excel(io.BytesIO(contents), header=None, dtype=str, nrows=10)
     except Exception as exc:
         raise HTTPException(400, f"Impossible de lire le fichier Excel : {exc}")
 
-    # Normaliser les noms de colonnes (espaces parasites fréquents dans les exports Excel)
-    df.columns = df.columns.str.strip()
+    all_text = df_raw.to_string().upper()
 
-    # Vérification des colonnes obligatoires du fichier MTN_SITES.xlsx
-    required_cols = {"CODE SITE", "Site Name", "STO", "Subcontractor Name", "Region", "Type of power source"}
+    if 'CODE SITE' in all_text:
+        # Format A — MTN Sites list
+        header_row = 0
+        col_code         = 'CODE SITE'
+        col_nom          = 'Site Name'
+        col_sto          = 'STO'
+        col_sbc          = 'Subcontractor Name'
+        col_region       = 'Region'
+        col_power        = 'Type of power source'
+        col_marque_ge    = 'GE brand'
+        col_puissance_ge = 'GE capacity (KVA)'
+    elif 'SITE ID' in all_text and 'EXECUTED DATE' in all_text:
+        # Format B — Rapport d'exécution utilisé comme liste de sites
+        header_row = _detect_header_row(df_raw, ['Site ID', 'ASP', 'Executed date'])
+        col_code         = 'Site ID'
+        col_nom          = 'Site Name'
+        col_sto          = 'STO'
+        col_sbc          = 'ASP'
+        col_region       = 'Region'
+        col_power        = 'Type of Power Supply'
+        col_marque_ge    = 'DG Type'
+        col_puissance_ge = 'DG Capacity kVA'
+    else:
+        raise HTTPException(400, (
+            "Format de fichier non reconnu. "
+            "Colonnes attendues : 'CODE SITE' (format MTN) ou 'Site ID' + 'Executed date' (rapport d'exécution)"
+        ))
+
+    try:
+        df = pd.read_excel(io.BytesIO(contents), header=header_row)
+    except Exception as exc:
+        raise HTTPException(400, f"Impossible de lire le fichier Excel : {exc}")
+
+    # Normaliser les noms de colonnes (sauts de ligne et espaces parasites)
+    df.columns = [str(c).replace('\n', ' ').strip() for c in df.columns]
+
+    # Vérifier les colonnes obligatoires après détection du format
+    required_cols = {col_code, col_nom, col_sbc, col_sto, col_region, col_power}
     missing = required_cols - set(df.columns)
     if missing:
         raise HTTPException(400, (
@@ -356,7 +437,7 @@ def mise_a_jour_mensuelle(
             f"Colonnes présentes : {list(df.columns[:15])}"
         ))
 
-    # Catégorisation depuis 'Type of power source'
+    # Catégorisation depuis la colonne type d'alimentation
     _POWER_TO_CAT: dict[str, str] = {
         "grid only":  "GRID_ONLY",
         "grid gen":   "GRID_GEN",
@@ -364,44 +445,42 @@ def mise_a_jour_mensuelle(
         "gen only":   "GEN_ONLY",
     }
 
-    # Colonnes GE optionnelles (présentes dans MTN_SITES.xlsx mais sans champ modèle dédié)
-    has_ge_brand    = "GE brand"           in df.columns
-    has_ge_capacity = "GE capacity (KVA)"  in df.columns
+    # Colonnes GE optionnelles
+    has_ge_brand    = col_marque_ge    in df.columns
+    has_ge_capacity = col_puissance_ge in df.columns
 
     # Lecture et normalisation des lignes
     excel_sites: dict[str, dict] = {}
     for _, row in df.iterrows():
         try:
-            raw_code = row.get("CODE SITE", "")
+            raw_code = row.get(col_code, "")
             if pd.isna(raw_code) or str(raw_code).strip() in ("", "nan"):
                 continue
             code = str(raw_code).strip().upper()
             if not code.startswith("CI"):
                 continue
 
-            power_raw = str(row.get("Type of power source", "") or "").strip()
+            power_raw = str(row.get(col_power, "") or "").strip()
             cat_key = power_raw.lower()
             if cat_key not in _POWER_TO_CAT:
                 continue  # Source d'alimentation inconnue → ligne ignorée
 
-            # Champs GE lus pour information (non stockés — modèle sans colonne dédiée)
-            marque_ge   = str(row["GE brand"]          or "").strip() if has_ge_brand    else None
-            puissance_ge = str(row["GE capacity (KVA)"] or "").strip() if has_ge_capacity else None
-            if marque_ge   in ("", "nan", "NaT"): marque_ge    = None
+            marque_ge    = str(row[col_marque_ge]    or "").strip() if has_ge_brand    else None
+            puissance_ge = str(row[col_puissance_ge] or "").strip() if has_ge_capacity else None
+            if marque_ge    in ("", "nan", "NaT"): marque_ge    = None
             if puissance_ge in ("", "nan", "NaT"): puissance_ge = None
 
             excel_sites[code] = {
                 "code_site": code,
-                "nom": str(row.get("Site Name", "") or "").strip(),
+                "nom": str(row.get(col_nom, "") or "").strip(),
                 "categorie": _POWER_TO_CAT[cat_key],
-                "sbc": str(row.get("Subcontractor Name", "") or "").strip(),
-                "sto": str(row.get("STO", "") or "").strip(),
-                "region": str(row.get("Region", "") or "").strip(),
+                "sbc": str(row.get(col_sbc, "") or "").strip(),
+                "sto": str(row.get(col_sto, "") or "").strip(),
+                "region": str(row.get(col_region, "") or "").strip(),
                 "type_alimentation": power_raw or None,
                 "cycle": None,
-                # GE — conservés dans le dict pour traçabilité future si le modèle évolue
-                "_marque_ge": marque_ge,
-                "_puissance_ge": puissance_ge,
+                "marque_ge":    marque_ge,
+                "puissance_ge": puissance_ge,
                 # Colonnes enrichies (optionnelles)
                 "date_handover":   _safe_date_from_excel(row.get("Date of Handhover")),
                 "techno":          _safe_str(row.get("TECHNO")),

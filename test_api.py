@@ -158,13 +158,18 @@ def auth_header(token):
 
 
 def make_excel(rows: list[dict]) -> bytes:
-    """Crée un fichier Excel en mémoire à partir d'une liste de dicts."""
+    """Crée un fichier Excel au format SBC rapport (colonnes attendues par le backend)."""
     wb = openpyxl.Workbook()
     ws = wb.active
-    if rows:
-        ws.append(list(rows[0].keys()))
-        for row in rows:
-            ws.append(list(row.values()))
+    # En-têtes exactes attendues par l'endpoint /upload
+    ws.append(["Site ID", "ASP", "Executed date", "Work Order Number"])
+    for row in rows:
+        ws.append([
+            row.get("code_site", ""),
+            row.get("sbc", "Afro"),
+            row.get("date_exec", ""),
+            row.get("wo_ticket", ""),
+        ])
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -342,63 +347,67 @@ class TestPlanning:
 # ---------------------------------------------------------------------------
 
 class TestImports:
-    def test_upload_valid_excel(self, token, test_passages, db):
-        # Trouver un passage existant pour CI00001 mois 1
-        passage = db.execute(
-            select(Passage).join(Site).where(
-                Site.code_site == "CI00001",
-                Passage.mois_num == 1
-            )
-        ).scalar()
-        assert passage is not None, "Passage CI00001/mois 1 introuvable"
+   def test_upload_valid_excel(self, token, test_passages, db):
+    passage = db.execute(
+        select(Passage).join(Site).where(
+            Site.code_site == "CI00001",
+            Passage.mois_num == 1
+        )
+    ).scalar()
+    assert passage is not None, "Passage CI00001/mois 1 introuvable"
 
-        excel_data = make_excel([
-            {"code_site": "CI00001", "mois_num": 1,
-             "date_exec": "2026-01-15", "wo_ticket": "WO-UPLOAD-001"},
-        ])
-        with TestClient(app) as c:
-            r = c.post(
-                "/api/v1/imports/upload",
-                files={"file": ("rapport.xlsx", excel_data,
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                headers=auth_header(token),
-            )
-        assert r.status_code == 201
-        body = r.json()
-        assert body["integres"] == 1
-        assert body["doublons"] == 0
-        assert body["non_trouves"] == 0
+    excel_data = make_excel([
+        {"code_site": "CI00001", "sbc": "Afro",
+         "date_exec": "2026-01-15", "wo_ticket": "WO-UPLOAD-001"},
+    ])
+    with TestClient(app) as c:
+        r = c.post(
+            "/api/v1/imports/upload",
+            files={"file": ("rapport.xlsx", excel_data,
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            headers=auth_header(token),
+        )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["integres"] == 1
+    assert body["doublons"] == 0
+    assert body["non_trouves"] == 0
 
-    def test_upload_deduplicate_wo(self, token, test_passages, db):
-        excel_data = make_excel([
-            {"code_site": "CI00001", "mois_num": 1, "date_exec": "2026-01-10", "wo_ticket": "WO-DUP"},
-            {"code_site": "CI00001", "mois_num": 2, "date_exec": "2026-02-10", "wo_ticket": "WO-DUP"},
-        ])
-        with TestClient(app) as c:
-            r = c.post(
-                "/api/v1/imports/upload",
-                files={"file": ("rapport.xlsx", excel_data,
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                headers=auth_header(token),
-            )
-        assert r.status_code == 201
-        body = r.json()
-        assert body["integres"] == 1
-        assert body["doublons"] == 1
 
-    def test_upload_unknown_site(self, token, test_passages):
-        excel_data = make_excel([
-            {"code_site": "CI99999", "mois_num": 1, "date_exec": "2026-01-10", "wo_ticket": "WO-UNK"},
-        ])
-        with TestClient(app) as c:
-            r = c.post(
-                "/api/v1/imports/upload",
-                files={"file": ("rapport.xlsx", excel_data,
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                headers=auth_header(token),
-            )
-        assert r.status_code == 201
-        assert r.json()["non_trouves"] == 1
+def test_upload_deduplicate_wo(self, token, test_passages, db):
+    excel_data = make_excel([
+        {"code_site": "CI00001", "sbc": "Afro",
+         "date_exec": "2026-01-10", "wo_ticket": "WO-DUP"},
+        {"code_site": "CI00001", "sbc": "Afro",
+         "date_exec": "2026-02-10", "wo_ticket": "WO-DUP"},
+    ])
+    with TestClient(app) as c:
+        r = c.post(
+            "/api/v1/imports/upload",
+            files={"file": ("rapport.xlsx", excel_data,
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            headers=auth_header(token),
+        )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["integres"] == 1
+    assert body["doublons"] == 1
+
+
+def test_upload_unknown_site(self, token, test_passages):
+    excel_data = make_excel([
+        {"code_site": "CI99999", "sbc": "Afro",
+         "date_exec": "2026-01-10", "wo_ticket": "WO-UNK"},
+    ])
+    with TestClient(app) as c:
+        r = c.post(
+            "/api/v1/imports/upload",
+            files={"file": ("rapport.xlsx", excel_data,
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            headers=auth_header(token),
+        )
+    assert r.status_code == 201
+    assert r.json()["non_trouves"] == 1
 
     def test_upload_wrong_format(self, token):
         with TestClient(app) as c:
